@@ -1,3 +1,13 @@
+# ==============================
+# SGSB midgut scRNA-seq workflow
+# Author: Surjeet Kumar Arya
+# Repo: https://github.com/Aryantextaholic/SGSB_scRNAseq_2026
+# ==============================
+
+# ---- User settings ----
+INPUT_RDS <- "data/SGSB_integ.rds"
+OUTDIR <- "results"
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
 
 library(Seurat)
 library(patchwork)
@@ -129,17 +139,6 @@ VlnPlot(SGSB_integ, features = gene_ID,  log = TRUE)
 
 # Feature plot for specific gene
 FeaturePlot(SGSB_integ, features = gene_ID)
-
-
-
-#NEZAVI-LOCUS14563: Aminopeptidase N
-#NEZAVI-LOCUS3639: DE-Cadherins
-#NEZAVI-LOCUS15376: Alkaline phosphatase
-#NEZAVI-LOCUS12249: ATP-binding cassettes A
-
-
-
-
 
 ######
 
