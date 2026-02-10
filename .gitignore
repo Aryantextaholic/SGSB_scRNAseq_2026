@@ -1,0 +1,12 @@
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store
+
+# Large objects
+*.rds
+*.h5
+*.h5ad
+*.loom
+data/
+results/
