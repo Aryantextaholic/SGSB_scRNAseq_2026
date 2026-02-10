@@ -1,480 +1,233 @@
-# ==============================
-# SGSB midgut scRNA-seq workflow
-# Author: Surjeet Kumar Arya
+# =========================================================
+# SGSB midgut scRNA-seq workflow (10x -> Seurat -> Harmony -> Monocle3)
+# Author: Dr. Surjeet Kumar Arya
 # Repo: https://github.com/Aryantextaholic/SGSB_scRNAseq_2026
-# ==============================
+# =========================================================
 
-# ---- User settings ----
-INPUT_RDS <- "data/SGSB_integ.rds"
-OUTDIR <- "results"
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(harmony)
+  library(DoubletFinder)
+  library(monocle3)
+  library(SeuratWrappers)
+})
+
+# -----------------------
+# 0) User settings
+# -----------------------
+BASE_DIR   <- "/Users/surjeetarya/Desktop/All_folders/SGSB/SGSB_re_analysis/sgsb_MT/"
+REP1_DIR   <- file.path(BASE_DIR, "filtered_feature_bc_matrix_rep1_MT")
+REP2_DIR   <- file.path(BASE_DIR, "filtered_feature_bc_matrix_rep2_merged_MT")
+
+MT_GENE_CSV <- file.path(BASE_DIR, "sgsb_MT.csv")   # CSV with column GeneName
+OUTDIR      <- "results"
 dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
 
-library(Seurat)
-library(patchwork)
-library(magrittr)
-library(gridExtra)
-library(harmony)
-library(dplyr)
-library(tidyr)
-library(DoubletFinder)
-library(monocle3)
-library(SeuratWrappers)
-library(ggplot2)
-library(tidyverse)
-library(ggplot2)
-library(cowplot)
+# QC thresholds (change as needed)
+QC_REP1 <- list(feature_min=300, feature_max=1500, count_min=300,  count_max=6000,  percent_mt_max=10)
+QC_REP2 <- list(feature_min=800, feature_max=1500, count_min=1000, count_max=5000,  percent_mt_max=10)
 
-SGSB_integ <- readRDS("/Users/surjeetarya/Desktop/All_files/All_single_data/Insects_data/SGSB/Paper_revised/Final_SGSB_Revissed_2024/SGSB_New/SGSB_Final_tutorial_integ_prep_2.rds")
+# Integration / clustering settings
+DIMS_USE <- 1:20
+RESOLUTION <- 0.5
+HARMONY_THETA <- 1
 
-dim1 <- DimPlot(SGSB_integ, reduction = "UMAP", group.by = "seurat_clusters")
+# DoubletFinder settings
+DF_PCS <- 1:20
+DF_pN  <- 0.25
+DF_rate <- 0.10  # expected doublet rate (10%)
 
-dim1
+# -----------------------
+# 1) Input checks
+# -----------------------
+stopifnot(dir.exists(REP1_DIR), dir.exists(REP2_DIR), file.exists(MT_GENE_CSV))
 
-## Run Harmony
+mt_genes <- read.csv(MT_GENE_CSV)$GeneName
+if (length(mt_genes) < 10) warning("MT gene list seems small; check MT_GENE_CSV column GeneName.")
 
-SGSB_integ <- RunHarmony(SGSB_integ, features = VariableFeatures(integrated),group.by.vars = "Sampletype",  theta = 1)
+# -----------------------
+# 2) Helper functions
+# -----------------------
+read_and_preprocess <- function(data_dir, project_name, mt_genes) {
+  counts <- Read10X(data.dir = data_dir)
+  seu <- CreateSeuratObject(counts = counts, project = project_name)
+  seu <- PercentageFeatureSet(seu, features = mt_genes, col.name = "percent.mt")
+  return(seu)
+}
 
-SGSB_integ <- SCTransform(SGSB_integ, verbose = FALSE)
+quality_control <- function(seu, qc) {
+  subset(
+    seu,
+    subset =
+      nFeature_RNA >= qc$feature_min &
+      nFeature_RNA <= qc$feature_max &
+      nCount_RNA   >= qc$count_min &
+      nCount_RNA   <= qc$count_max &
+      percent.mt   <= qc$percent_mt_max
+  )
+}
 
-# Prepare the data for finding markers
-SGSB_integ <- PrepSCTFindMarkers(SGSB_integ)
+run_df_single <- function(seu, pcs=1:20, pN=0.25, expected_rate=0.10) {
+  # standard log-normalize + HVG + PCA + clustering to get seurat_clusters
+  seu <- NormalizeData(seu)
+  seu <- FindVariableFeatures(seu)
+  seu <- ScaleData(seu, vars.to.regress = c("nCount_RNA","percent.mt"))
+  seu <- RunPCA(seu, verbose = FALSE)
+  seu <- FindNeighbors(seu, dims = pcs)
+  seu <- FindClusters(seu, resolution = 0.5)
+  seu <- RunUMAP(seu, dims = pcs)
 
+  sweep.res.list <- paramSweep_v3(seu, PCs = pcs, sct = FALSE)
+  sweep.stats    <- summarizeSweep(sweep.res.list, GT = FALSE)
+  bcmvn          <- find.pK(sweep.stats)
 
-## Assuming you have loaded Seurat and ggplot2 libraries
-library(Seurat)
-library(ggplot2)
+  best_pK <- bcmvn %>%
+    dplyr::filter(BCmetric == max(BCmetric)) %>%
+    dplyr::pull(pK) %>%
+    as.character() %>%
+    as.numeric()
 
-new.cluster.ids <- c(" IEC", "EC like 1", "EC like 2", "pEC1", "pEC2", "mEC1", "SC/EB", "mEC2", "GC", "ECM-EpC", "EE", "VM")
-names(new.cluster.ids) <- levels(SGSB_integ)
-SGSB_integ <- RenameIdents(SGSB_integ, new.cluster.ids)
+  annotations <- seu@meta.data$seurat_clusters
+  homotypic.prop <- modelHomotypic(annotations)
+  nExp_poi <- round(expected_rate * nrow(seu@meta.data))
+  nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
 
-# Create the DimPlot
-dim_plot <- DimPlot(SGSB_integ, reduction = "UMAP", label = TRUE, pt.size = 0.5) + NoLegend()
-
-# Modify the theme to make the cluster IDs bold
-dim_plot_sgsb <- dim_plot + theme(strip.text = element_text(face = "bold"))
-
-dim_plot_sgsb
-
-
-######
-
-dim_plot_sgsb <- DimPlot(
-  SGSB_integ,
-  reduction = "UMAP",
-  label = TRUE,
-  repel = TRUE,      # avoids label overlap
-  label.size = 7,    # big labels
-  pt.size = 0.4
-) +
-  NoLegend() +
-  theme(
-    text = element_text(face = "bold"),
-    axis.title = element_text(face = "bold", size = 16),
-    axis.text  = element_text(face = "bold", size = 16)
+  seu <- doubletFinder_v3(
+    seu,
+    PCs = pcs,
+    pN = pN,
+    pK = best_pK,
+    nExp = nExp_poi.adj,
+    reuse.pANN = FALSE,
+    sct = FALSE
   )
 
-dim_plot_sgsb
+  # find the DF classification column that was created
+  df_class_cols <- grep("^DF.classifications", colnames(seu@meta.data), value = TRUE)
+  if (length(df_class_cols) == 0) stop("DoubletFinder did not create DF.classifications column.")
+  df_col <- df_class_cols[length(df_class_cols)]  # take the newest
+  seu$DF_class <- seu@meta.data[[df_col]]
+
+  # keep singlets
+  seu_clean <- subset(seu, subset = DF_class == "Singlet")
+  return(list(seu_raw = seu, seu_clean = seu_clean, best_pK = best_pK, df_col = df_col))
+}
+
+# -----------------------
+# 3) Read + QC each replicate
+# -----------------------
+rep1 <- read_and_preprocess(REP1_DIR, "SGSB_1", mt_genes)
+rep2 <- read_and_preprocess(REP2_DIR, "SGSB_2", mt_genes)
+
+rep1_qc <- quality_control(rep1, QC_REP1)
+rep2_qc <- quality_control(rep2, QC_REP2)
+
+saveRDS(rep1_qc, file.path(OUTDIR, "SGSB_rep1_QC.rds"))
+saveRDS(rep2_qc, file.path(OUTDIR, "SGSB_rep2_QC.rds"))
+
+# -----------------------
+# 4) DoubletFinder per replicate (recommended)
+# -----------------------
+df1 <- run_df_single(rep1_qc, pcs=DF_PCS, pN=DF_pN, expected_rate=DF_rate)
+df2 <- run_df_single(rep2_qc, pcs=DF_PCS, pN=DF_pN, expected_rate=DF_rate)
+
+saveRDS(df1$seu_raw,   file.path(OUTDIR, "SGSB_rep1_after_DF_raw.rds"))
+saveRDS(df1$seu_clean, file.path(OUTDIR, "SGSB_rep1_after_DF_singlets.rds"))
+saveRDS(df2$seu_raw,   file.path(OUTDIR, "SGSB_rep2_after_DF_raw.rds"))
+saveRDS(df2$seu_clean, file.path(OUTDIR, "SGSB_rep2_after_DF_singlets.rds"))
+
+message("Rep1 best pK: ", df1$best_pK, " | DF column: ", df1$df_col)
+message("Rep2 best pK: ", df2$best_pK, " | DF column: ", df2$df_col)
+
+# -----------------------
+# 5) Merge replicates + add metadata
+# -----------------------
+merged <- merge(df1$seu_clean, y = df2$seu_clean, add.cell.ids = c("Rep1","Rep2"), project = "SGSB_merged")
+
+merged$sample <- rownames(merged@meta.data)
+merged@meta.data <- separate(merged@meta.data, col = "sample", into = c("Sampletype","Barcode"), sep = "_", remove = FALSE)
+
+saveRDS(merged, file.path(OUTDIR, "SGSB_merged_singlets.rds"))
+
+# -----------------------
+# 6) Integration (CCA) + optional Harmony
+# -----------------------
+obj.list <- SplitObject(merged, split.by = "Sampletype")
+obj.list <- lapply(obj.list, NormalizeData)
+obj.list <- lapply(obj.list, FindVariableFeatures)
+
+features <- SelectIntegrationFeatures(object.list = obj.list)
+anchors  <- FindIntegrationAnchors(object.list = obj.list, anchor.features = features)
+integrated <- IntegrateData(anchors)
+
+DefaultAssay(integrated) <- "integrated"
+integrated <- ScaleData(integrated, verbose = FALSE)
+integrated <- RunPCA(integrated, verbose = FALSE)
+
+# Option A: cluster using integrated PCA
+integrated <- FindNeighbors(integrated, dims = DIMS_USE)
+integrated <- FindClusters(integrated, resolution = RESOLUTION)
+integrated <- RunUMAP(integrated, dims = DIMS_USE)
+
+# Option B: Harmony on PCA (batch correction)
+integrated <- RunHarmony(
+  object = integrated,
+  group.by.vars = "Sampletype",
+  reduction = "pca",
+  dims.use = DIMS_USE,
+  theta = HARMONY_THETA
+)
+
+integrated <- RunUMAP(integrated, reduction = "harmony", dims = DIMS_USE, reduction.name = "umap_harmony")
+integrated <- FindNeighbors(integrated, reduction = "harmony", dims = DIMS_USE)
+integrated <- FindClusters(integrated, resolution = RESOLUTION)
+
+saveRDS(integrated, file.path(OUTDIR, "SGSB_integrated_harmony.rds"))
+
+p_umap <- DimPlot(integrated, reduction = "umap_harmony", label = TRUE, repel = TRUE) + NoLegend()
+ggsave(file.path(OUTDIR, "UMAP_harmony.png"), p_umap, width = 7, height = 6, dpi = 300)
+
+# -----------------------
+# 7) Markers
+# -----------------------
+DefaultAssay(integrated) <- "RNA"
+integrated <- SCTransform(integrated, verbose = FALSE)
+integrated <- PrepSCTFindMarkers(integrated)
+
+# example markers per cluster
+markers <- FindAllMarkers(integrated, only.pos = TRUE)
+write.csv(markers, file.path(OUTDIR, "markers_FindAllMarkers.csv"), row.names = FALSE)
+
+# -----------------------
+# 8) Monocle3 pseudotime
+# -----------------------
+# Use harmony UMAP coordinates if you want:
+# Embeddings(integrated, "umap_harmony")
+cds <- as.cell_data_set(integrated)
+reducedDims(cds)$UMAP <- Embeddings(integrated, "umap_harmony")
+colData(cds)$ident <- as.character(Idents(integrated))
 
-
-
-
-######
-
-saveRDS(SGSB_integ, file = "/Users/surjeetarya/Desktop/All_single_data/SGSB/Code_for_analysis/SGSB_Final_tutorial_Idents.rds")
-
-
-DimPlot(SGSB_integ, split.by = 'Sampletype')
-
-DimPlot(SGSB_integ, group.by = c("orig.ident", "ident"))
-
-DimPlot(SGSB_integ, group.by =  "ident")
-
-
-# Prepare the data for finding markers
-SGSB_integ <- PrepSCTFindMarkers(SGSB_integ)
-
-Violin_before <- VlnPlot(SGSB_integ, features =c('nFeature_RNA','nCount_RNA','percent.mt'))
-Violin_before
-
-# -----------------
-# Additional Plots
-# -----------------
-
-# Violin plot for specific gene
-VlnPlot(SGSB_integ, features = c("NEZAVI-LOCUS3023"),  log = TRUE)
-
-
-
-#####
-
-VlnPlot(
-  SGSB_integ,
-  features = "NEZAVI-LOCUS7980",
-  log = TRUE
-) +
-  theme(
-    axis.title.x = element_text(face = "bold", size = 18),
-    axis.title.y = element_text(face = "bold", size = 18),
-    axis.text.x  = element_text(face = "bold", size = 18),
-    axis.text.y  = element_text(face = "bold", size = 18)
-  )
-
-
-
-#####
-
-
-genelist2 <- read.csv("ALKP_genes.csv")
-
-genelist2 <- read.csv("ATP_binding_cassettes.csv")
-
-genelist2 <- read.csv("ABCA_transporter.csv")
-
-gene_ID <- genelist2$GeneNames
-
-#head(genelist2)
-
-VlnPlot(SGSB_integ, features = gene_ID,  log = TRUE)
-
-# Feature plot for specific gene
-FeaturePlot(SGSB_integ, features = gene_ID)
-
-######
-
-# Finding markers for cluster 1
-clustermEC2.markers <- FindMarkers(SGSB_integ, ident.1 = "mEC2", ident.2 = NULL, only.pos = FALSE)
-
-# Writing cluster markers to a CSV file
-write.csv(clustermEC2.markers, "/Users/surjeetarya/Library/CloudStorage/OneDrive-UniversityofKentucky/Desktop/Desktope_2026/Manuscript/SGSB/Manuscript_SGSB/Markers/cluster_mEC2.csv")
-
-
-
-
-######
-
-
-
-
-
-# Violin plot for specific gene
-VlnPlot(SGSB_integ, features = c("NEZAVI-LOCUS280","NEZAVI-LOCUS3642","NEZAVI-LOCUS15255"), slot = "counts", log = TRUE)
-
-
-VlnPlot()
-
-# Feature plot for specific gene
-FeaturePlot(SGSB_integ, features = c("NEZAVI-LOCUS2664")) # EC
-FeaturePlot(SGSB_integ, features = c("NEZAVI-LOCUS10578")) # EB
-FeaturePlot(SGSB_integ, features = c("NEZAVI-LOCUS1470")) # VM
-FeaturePlot(SGSB_integ, features = c("NEZAVI-LOCUS13387")) # EE
-FeaturePlot(SGSB_integ, features = c("NEZAVI-LOCUS6785"))  # GC
-FeaturePlot(SGSB_integ, features = c("NEZAVI-LOCUS13292")) # SC
-
-################################ Trajectory analysis ################################################
-
-library(ggplot2)
-library(patchwork)
-library(SeuratWrappers)
-
-
-install.packages("remotes")
-
-remotes::install_github("satijalab/seurat-wrappers")
-
-## install in terminal for mac: brew install hdf5 pkg-config
-
-
-devtools::install_github('cole-trapnell-lab/monocle3')
-
-install.packages("devtools")
-remotes::install_github("bnprks/BPCells/r")
-
-install.packages("igraph", type = "source", dependencies = TRUE)
-
-
-
-####################### Analysis ######
-
-library(monocle3)
-library(Seurat)
-library(dplyr)
-library(ggplot2)
-library(patchwork)
-
-# 1) Convert Seurat -> Monocle3
-cds <- as.cell_data_set(SGSB_integ)
-
-
-Reductions(SGSB_integ)
-
-
-# 2) Put Seurat UMAP coordinates into Monocle3 BEFORE clustering
-reducedDims(cds)$UMAP <- Embeddings(SGSB_integ, "UMAP")
-
-# 3) Bring Seurat cluster identities into colData(cds)
-colData(cds)$cluster <- as.character(Idents(SGSB_integ))  # make sure identities are set in Seurat
-
-# Optional: keep nCount_RNA if present
-# View(colData(cds)$nCount_RNA)
-
-# 4) Cluster cells in monocle3 space using UMAP
 cds <- cluster_cells(cds, reduction_method = "UMAP")
-
-# 5) Plots
-p1 <- plot_cells(cds, show_trajectory_graph = FALSE)
-p2 <- plot_cells(cds, color_cells_by = "partition", show_trajectory_graph = FALSE)
-p1 + p2
-
-# 6) Learn trajectory graph
 cds <- learn_graph(cds, use_partition = FALSE)
 
-# 7) Choose root cells from a known cluster label (example: "SC")
-
-#root_cells <- rownames(subset(colData(cds), cluster %in% c("SC (4)")))
-
-root_cells <- rownames(subset(as.data.frame(colData(cds)), cluster == "SC/EB"))
-
-cds <- order_cells(cds, reduction_method = "UMAP", root_cells = root_cells)
-
-plot_cells(cds,
-           color_cells_by = "pseudotime",
-           label_groups_by_cluster = FALSE,
-           label_branch_points = FALSE,
-           label_roots = FALSE,
-           label_leaves = FALSE)
-
-
-p_pt <- plot_cells(cds,
-                   color_cells_by = "pseudotime",
-                   label_groups_by_cluster = FALSE,
-                   label_branch_points = FALSE,
-                   label_roots = FALSE,
-                   label_leaves = FALSE)
-
-p_cl <- plot_cells(cds,
-                   color_cells_by = "cluster",
-                   label_groups_by_cluster = TRUE,
-                   label_branch_points = FALSE,
-                   label_roots = FALSE,
-                   label_leaves = FALSE,
-                   group_label_size = 5)
-
-p_pt | p_cl
-
-
-
-colnames(colData(cds))
-
-
-
-####
-
-library(patchwork)
-
-p_pt <- plot_cells(
-  cds,
-  color_cells_by = "monocle3_pseudotime",   # or "pseudotime" if that works in your cds
-  label_cell_groups = FALSE,
-  label_branch_points = FALSE,
-  label_roots = FALSE,
-  label_leaves = FALSE
-)
-
-p_pt <- p_pt +
-  theme(
-    axis.title = element_text(size = 16, face = "bold"),
-    axis.text  = element_text(size = 12),
-    legend.title = element_text(size = 14, face = "bold"),
-    legend.text  = element_text(size = 12)
-  )
-
-
-
-p_pt
-
-p_id <- plot_cells(
-  cds,
-  color_cells_by = "ident",                 # <-- your cluster identity labels
-  label_cell_groups = TRUE,                 # <-- this labels groups from colData
-  label_branch_points = FALSE,
-  label_roots = FALSE,
-  label_leaves = FALSE,
-  group_label_size = 6
-)
-
-p_pt | p_id
-
-cds_epi <- cds[, !colData(cds)$ident %in% c("VM")]
-
-plot_cells(
-  cds_epi,
-  color_cells_by = "ident",
-  label_cell_groups = TRUE
-)
-
-plot_cells(
-  cds,
-  color_cells_by = "ident",
-  label_cell_groups = TRUE,
-  label_branch_points = FALSE,
-  label_roots = FALSE,
-  label_leaves = FALSE,
-  group_label_size = 6
-)
-
-
-
-
-
-
-
-
-
-
-
-
-# 8) Save
-saveRDS(cds, file = "/Users/surjeetarya/Desktop/All_single_data/SGSB/Code_for_analysis/SGSB_Final_tutorial_Idents_Pseudotime_2.rds")
-
-# 9) Pseudotime in metadata
-colData(cds)$monocle3_pseudotime <- pseudotime(cds)
-data.pseudo <- as.data.frame(colData(cds))
-
-ggplot(data.pseudo,
-       aes(monocle3_pseudotime,
-           reorder(cluster, monocle3_pseudotime, median),
-           fill = cluster)) +
-  geom_boxplot()
-
-# 10) Genes changing with pseudotime
-deg_bcells <- graph_test(cds, neighbor_graph = "principal_graph", cores = 4)
-
-deg_bcells %>%
-  arrange(q_value) %>%
-  filter(status == "OK") %>%
-  head()
-
-
-
-
-
-###################### End ##############
-
-
-
-
-
-
-
-#############################
-
-cds <- as.cell_data_set(SGSB_integ)
-cds <- cluster_cells(cds)
-p1 <- plot_cells(cds, show_trajectory_graph = FALSE)
-p2 <- plot_cells(cds, color_cells_by = "partition", show_trajectory_graph = FALSE)
-wrap_plots(p1, p2)
-
-View(cds@colData$nCount_RNA)
-
-
-# assign paritions
-reacreate.partition <- c(rep(1,length(cds@colData@rownames)))
-names(reacreate.partition) <- cds@colData@rownames
-reacreate.partition <- as.factor(reacreate.partition)
-
-cds@clusters$UMAP$partitions <- reacreate.partition
-
-# Assign the cluster info 
-
-SGSB_integ@active.ident
-
-list_cluster <- SGSB_integ@active.ident
-cds@clusters$UMAP$clusters <- list_cluster
-
-
-# Assign UMAP coordinate - cell embeddings
-
-cds@int_colData@listData$reducedDims$UMAP <- SGSB_integ@reductions$UMAP@cell.embeddings
-
-
-# plot
-
-cluster.before.trajectory <- plot_cells(cds,
-                                        color_cells_by = 'cluster',
-                                        label_groups_by_cluster = FALSE,
-                                        group_label_size = 5) +
-  theme(legend.position = "right")
-
-cluster.names <- plot_cells(cds,
-                            color_cells_by = "cluster",
-                            label_groups_by_cluster = FALSE,
-                            group_label_size = 5) +
-  scale_color_manual(values = c('red', 'blue', 'green', 'maroon', 'yellow','pink','black','orange','darkgreen','violet','brown','lightgreen')) +
-  theme(legend.position = "right")
-
-cluster.before.trajectory | cluster.names
-
-
-
-# ...3. Learn trajectory graph ------------------------
-cds <- learn_graph(cds, use_partition = FALSE)
-
-v1 <- plot_cells(cds,
-                 color_cells_by = 'cluster',
-                 label_groups_by_cluster = FALSE,
-                 label_branch_points = FALSE,
-                 label_roots = FALSE,
-                 label_leaves = FALSE,
-                 group_label_size = 5)
-
-v1
-
-
-# ...4. Order the cells in pseudotime -------------------
-
-cds <- order_cells(cds, reduction_method = 'UMAP', root_cells = colnames(cds[,clusters(cds) == 'SC']))
-
-table(clusters(cds))
-
-plot_cells(cds,
-           color_cells_by = 'pseudotime',
-           label_groups_by_cluster = FALSE,
-           label_branch_points = FALSE,
-           label_roots = FALSE,
-           label_leaves = FALSE)
-
-
-
-saveRDS(cds, file = "/Users/surjeetarya/Desktop/All_single_data/SGSB/Code_for_analysis/SGSB_Final_tutorial_Idents_Pseudotime_2.rds")
-
-
-# cells ordered by monocle3 pseudotime
-
-pseudotime(cds)
-cds$monocle3_pseudotime <- pseudotime(cds)
-data.pseudo <- as.data.frame(colData(cds))
-
-#ggplot(data.pseudo, aes(monocle3_pseudotime, ident, fill = ident)) +
-geom_boxplot()
-
-ggplot(data.pseudo, aes(monocle3_pseudotime, reorder(ident, monocle3_pseudotime, median), fill = ident)) +
-  geom_boxplot()
-
-
-# ...5. Finding genes that change as a function of pseudotime --------------------
-deg_bcells <- graph_test(cds, neighbor_graph = 'principal_graph', cores = 4)
-
-class(cds)
-dim(cds)
-
-
-results_1 <- deg_bcells
-
-results_1
-
-deg_bcells %>% 
-  arrange(q_value) %>% 
-  filter(status == 'OK') %>% 
-  head()
-
+# root example: use SC/EB if present
+if ("SC/EB" %in% unique(colData(cds)$ident)) {
+  root_cells <- rownames(subset(as.data.frame(colData(cds)), ident == "SC/EB"))
+  cds <- order_cells(cds, reduction_method = "UMAP", root_cells = root_cells)
+} else {
+  cds <- order_cells(cds, reduction_method = "UMAP")
+}
+
+p_pt <- plot_cells(cds, color_cells_by = "pseudotime", label_cell_groups = FALSE)
+ggsave(file.path(OUTDIR, "Monocle3_pseudotime.png"), p_pt, width = 7, height = 6, dpi = 300)
+
+deg_pseudo <- graph_test(cds, neighbor_graph = "principal_graph", cores = 4)
+write.csv(deg_pseudo, file.path(OUTDIR, "Monocle3_graph_test.csv"), row.names = FALSE)
+
+saveRDS(cds, file.path(OUTDIR, "SGSB_monocle3_cds.rds"))
+
+message("DONE. Checkpoints saved as .rds in: ", OUTDIR)
