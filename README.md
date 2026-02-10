@@ -1,3 +1,13 @@
+Pipeline:
+10x → QC → DoubletFinder → Integration → Harmony → Clustering → Marker discovery → Monocle3 pseudotime
+
+Species:
+_Nezara viridula_ midgut single-cell RNA-seq
+
+Author:
+Surjeet Kumar Arya, PhD
+University of Kentucky
+
 # SGSB midgut scRNA-seq analysis (Seurat + Harmony + DoubletFinder + Monocle3)
 
 This repository contains the R workflow used for single-cell RNA-seq analysis of the southern green stink bug (SGSB), *Nezara viridula*, midgut.
