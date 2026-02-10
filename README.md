@@ -12,6 +12,19 @@ University of Kentucky
 
 This repository contains the R workflow used for single-cell RNA-seq analysis of the southern green stink bug (SGSB), *Nezara viridula*, midgut.
 
+
+## Methods summary
+
+Single-cell RNA-seq data were processed using Seurat v5.
+Quality control thresholds were applied on gene counts,
+UMI counts, and mitochondrial gene percentages.
+
+Doublets were removed using DoubletFinder.
+Batch correction was performed using Harmony.
+Clusters were identified using shared nearest neighbor graphs.
+Pseudotime trajectories were reconstructed using Monocle3.
+
+
 ## Contents
 - `SGSB_final_midgut_scRNA_2026.R` — end-to-end analysis script (QC → normalization/integration → clustering/UMAP → markers → pseudotime)
 
