@@ -32,3 +32,13 @@ The script generates:
 ## Citation
 If you use this workflow, please cite:
 Arya SK et al. (manuscript in preparation / under review).
+
+
+## Data Availability
+
+Raw sequencing data are not included in this repository due to file size and institutional policies.
+
+Data are available from:
+- NCBI SRA: [accession will be added after publication]
+- Institutional storage: available upon reasonable request
+- Processed objects (.rds) available on request for reproducibility
